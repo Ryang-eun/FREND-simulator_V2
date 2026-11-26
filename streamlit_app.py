@@ -108,22 +108,29 @@ def generate(data, bins, seed, slopes, intercepts, comparator_sd, frend_sd):
     with TemporaryDirectory(prefix='frend-streamlit-') as temp:
         source = Path(temp) / 'template.xlsx'
         output = Path(temp) / 'result.xlsx'
-        command = [sys.executable, str(HERE / 'workbook_engine.py'), '--source', str(source),
+        command = [sys.executable, str(HERE / 'workbook_engine.py'),
                    '--output', str(output), '--seed', str(seed), '--counts', *map(str, counts),
                    '--bounds', *(str(edge) for lo,hi,_ in bins for edge in (lo,hi)),
                    '--slopes', *(f'{value:.15f}' for value in slopes),
                    '--intercepts', *(f'{value:.15f}' for value in intercepts),
                    '--between-method-sd', str(comparator_sd), '--between-frend-sd', str(frend_sd), '--json']
-        source.write_bytes(data)
+        if data is None:
+            command.append('--basic')
+        else:
+            source.write_bytes(data)
+            command.extend(('--source', str(source)))
         try:
             proc = subprocess.run(command, capture_output=True, timeout=50, check=True)
             result = json.loads(proc.stdout)
             result['workbook'] = output.read_bytes()
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             LOG.warning('Workbook engine failed: %s', type(exc).__name__)
-            raise ValueError('이 Excel 양식으로 결과를 생성할 수 없습니다. 기존 분석적 성능시험 양식을 확인해 주세요.') from exc
+            detail = ('입력 조건을 확인해 주세요.' if data is None
+                      else '선택한 분석적 성능시험 양식과 입력 조건을 확인해 주세요.')
+            raise ValueError('데이터와 엑셀을 생성할 수 없습니다. ' + detail) from exc
     result['filename'] = f'FREND_Method_Comparison_SIM_{seed}.xlsx'
     result['seed'] = seed
+    result['uses_template'] = data is not None
     return result
 
 
@@ -163,8 +170,9 @@ st.caption('Method Comparison · 합성 데이터')
 left, right = st.columns([.9,1.45], gap='large')
 with left:
     st.subheader('생성 조건')
-    upload = st.file_uploader('분석적 성능시험 엑셀 양식', type=['xlsx'],
-                             help='승인된 빈 양식을 사용하세요. 이 파일은 현재 세션의 엑셀 생성에 사용됩니다.')
+    with st.expander('기존 엑셀 양식 사용 (선택)'):
+        upload = st.file_uploader('분석적 성능시험 엑셀 양식', type=['xlsx'],
+                                 help='승인된 빈 양식을 사용하세요. 이 파일은 현재 세션의 엑셀 생성에 사용됩니다.')
     state = st.session_state
     if 'bin_base' not in state:
         state.bin_base = DEFAULT_BINS
@@ -209,8 +217,6 @@ with left:
     if st.button('데이터 생성', type='primary', key='generate', disabled=bins is None or len(table) != size):
         try:
             data = template_bytes(upload)
-            if data is None:
-                raise ValueError('분석적 성능시험 엑셀 양식을 먼저 업로드해 주세요.')
             with st.spinner('합성 데이터와 엑셀을 생성하는 중입니다.'):
                 state.result = generate(data, bins, seed, [slope1,slope2], [int1,int2], c_sd,f_sd)
         except (ValueError,OSError) as error:
@@ -220,7 +226,7 @@ with right:
     st.subheader('생성 결과')
     result = st.session_state.get('result')
     if result is None:
-        st.info('엑셀 양식을 선택한 뒤 데이터를 생성하면 결과가 표시됩니다.')
+        st.info('생성 조건을 입력하고 데이터 생성을 누르면 결과가 표시됩니다.')
     else:
         st.caption(f"생성된 검체 {len(result['replicates'])}개 · seed {result['seed']}")
         graphs, reps = st.tabs(['그래프', '반복값'])
@@ -238,6 +244,8 @@ with right:
                     st.altair_chart(scatter_chart(means,fit,x,y,domain), width='stretch', key=f'graph_{order}')
         with reps:
             st.html(replicates_html(result))
+        layout = '기존 시험 양식' if result['uses_template'] else '기본 양식 · 반복값, OLS, Pearson r'
+        st.caption(layout)
         st.download_button('엑셀 다운로드', result['workbook'], file_name=result['filename'],
                            mime=MIME, on_click='ignore', key='xlsx')
 

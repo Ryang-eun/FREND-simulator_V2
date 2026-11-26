@@ -3,7 +3,7 @@ from zipfile import ZipFile, ZIP_DEFLATED
 from xml.etree import ElementTree as ET
 from random import Random
 from statistics import mean, correlation, linear_regression
-import argparse, json, os, posixpath, re, tempfile
+import argparse, json, posixpath, re, tempfile
 
 SS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
 REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
@@ -13,6 +13,7 @@ RAW_PART = 'xl/worksheets/simulator_raw.xml'
 PKG_REL = 'http://schemas.openxmlformats.org/package/2006/relationships'
 args = argparse.ArgumentParser()
 args.add_argument('--source', type=Path)
+args.add_argument('--basic', action='store_true')
 args.add_argument('--output', type=Path)
 args.add_argument('--seed', type=int, default=261125)
 args.add_argument('--counts', type=int, nargs='+', default=(24,12,4))
@@ -25,6 +26,8 @@ args.add_argument('--json', action='store_true')
 options = args.parse_args()
 if len(options.bounds) != len(options.counts) * 2:
     args.error('Provide a lower and upper bound for each concentration bin.')
+if options.basic and options.source:
+    args.error('Choose the built-in layout or an Excel template.')
 rng = Random(options.seed)
 levels = ((0.5, 15), (2, 8), (5, 5), (30, 3))
 def sd(x):
@@ -111,8 +114,50 @@ def compact_strings(analysis, original_strings):
     strings = header + ''.join(entries[index] for index in indices) + '</sst>'
     return analysis, strings
 
+def write_basic_workbook(out, raw_xml, means):
+    headers = ('Synthetic sample','Comparator 1 mean','F10 mean','FREND 2.0 mean')
+    rows = [''.join(string(col,1,label) for col,label in zip('ABCD',headers))]
+    for i, sample in enumerate(zip(*means,strict=True), 2):
+        averages = ''.join(number(column,i,value,f"'{SHEET}'!{raw_column}{i+1}")
+                           for column,raw_column,value in zip('BCD','JDG',sample,strict=True))
+        rows.append(string('A',i,f'SIM-{i-1:03}') + averages)
+    headings = ('X device','Y device','N','OLS Slope','OLS Intercept','Pearson r')
+    rows[0] += ''.join(string(col,1,label) for col,label in zip('GHIJKL',headings))
+    end = len(rows)
+    for row, (x, y) in enumerate(((0,1),(0,2),(1,2)), 2):
+        x_col, y_col = 'BCD'[x], 'BCD'[y]
+        xs, ys = f'{x_col}2:{x_col}{end}', f'{y_col}2:{y_col}{end}'
+        fit = linear_regression(means[x],means[y])
+        rows[row-1] += string('G',row,headers[x+1].removesuffix(' mean'))
+        rows[row-1] += string('H',row,headers[y+1].removesuffix(' mean'))
+        rows[row-1] += number('I',row,end-1,f'COUNT({xs})')
+        rows[row-1] += number('J',row,fit.slope,f'SLOPE({ys},{xs})')
+        rows[row-1] += number('K',row,fit.intercept,f'INTERCEPT({ys},{xs})')
+        rows[row-1] += number('L',row,correlation(means[x],means[y]),f'CORREL({xs},{ys})')
+    data = ''.join(f'<row r="{i}">{cells}</row>' for i,cells in enumerate(rows,1))
+    analysis = (f'<worksheet xmlns="{SS}"><cols><col min="1" max="4" width="24" customWidth="1"/>'
+                f'<col min="7" max="12" width="17" customWidth="1"/></cols><sheetData>{data}</sheetData></worksheet>')
+    entries = {'xl/workbook.xml': 'sheet.main', 'xl/worksheets/analysis.xml': 'worksheet', RAW_PART: 'worksheet'}
+    overrides = ''.join(f'<Override PartName="/{path}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.{part}+xml"/>'
+                        for path,part in entries.items())
+    types = ('<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+             '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+             '<Default Extension="xml" ContentType="application/xml"/>' + overrides + '</Types>')
+    links = f'<Relationships xmlns="{PKG_REL}">'
+    workbook = (f'<workbook xmlns="{SS}" xmlns:r="{REL}"><sheets>'
+                f'<sheet name="Method comparison" sheetId="1" r:id="rId1"/>'
+                f'<sheet name="{SHEET}" sheetId="2" r:id="rId2"/></sheets>'
+                '<calcPr calcMode="auto" fullCalcOnLoad="1"/></workbook>')
+    with ZipFile(out,'w',ZIP_DEFLATED) as package:
+        package.writestr('[Content_Types].xml',types)
+        package.writestr('_rels/.rels',links + f'<Relationship Id="rId1" Type="{REL}/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+        package.writestr('xl/_rels/workbook.xml.rels',links + f'<Relationship Id="rId1" Type="{REL}/worksheet" Target="worksheets/analysis.xml"/>'
+                         f'<Relationship Id="rId2" Type="{REL}/worksheet" Target="worksheets/simulator_raw.xml"/></Relationships>')
+        package.writestr('xl/workbook.xml',workbook)
+        package.writestr('xl/worksheets/analysis.xml',analysis)
+        package.writestr(RAW_PART,raw_xml)
+
 root = Path(tempfile.gettempdir())
-source = options.source or max(root.glob('frend-template-*.xlsx'), key=lambda file:file.stat().st_mtime)
 out = options.output or Path(tempfile.mkdtemp(prefix='frend-pilot-'))/'synthetic-linkage-check.xlsx'
 groups = (('F10', 1, 'BCD'), ('FREND 2.0', 2, 'EFG'), ('Comparator 1', 0, 'HIJ'))
 rows = [
@@ -155,6 +200,20 @@ merges = '<mergeCells count="4"><mergeCell ref="A1:A2"/><mergeCell ref="B1:D1"/>
 raw_xml = (f'<worksheet xmlns="{SS}"><cols><col min="1" max="10" width="16" customWidth="1"/>'
            f'<col min="12" max="12" width="47" customWidth="1"/></cols><sheetData>{sheet_data}</sheetData>{merges}</worksheet>')
 
+means=[[mean(pairs[device]) for pairs in values] for device in range(3)]
+def print_summary():
+    pairs = [(means[1],means[2]), (means[0],means[1]), (means[0],means[2])]
+    print(json.dumps({'replicates':values,'mean':means,'correlations':
+        [correlation(x,y) for x,y in pairs],
+        'fits':[linear_regression(x,y)._asdict() for x,y in pairs]}))
+
+if options.basic:
+    write_basic_workbook(out, raw_xml, means)
+    if options.json:
+        print_summary()
+    raise SystemExit(0)
+
+source = options.source or max(root.glob('frend-template-*.xlsx'), key=lambda file:file.stat().st_mtime)
 with ZipFile(source) as original:
     workbook = original.read('xl/workbook.xml').decode()
     rel_path = 'xl/_rels/workbook.xml.rels'
@@ -245,12 +304,8 @@ with ZipFile(source) as original:
         chart_parts=[x for x in needed if re.fullmatch(r'xl/charts/chart\d+\.xml',x)]
         assert chart_parts and all(output.read(x)==original.read(x) for x in chart_parts)
 
-means=[[mean(pairs[device]) for pairs in values] for device in range(3)]
 if options.json:
-    pairs = [(means[1],means[2]), (means[0],means[1]), (means[0],means[2])]
-    print(json.dumps({'replicates':values,'mean':means,'correlations':
-        [correlation(x,y) for x,y in pairs],
-        'fits':[linear_regression(x,y)._asdict() for x,y in pairs]}))
+    print_summary()
 else:
     print(f'Verified {len(values)} paired specimens, {len(values)*3*2} raw numbers, {len(linked)} mean links, {len(chart_parts)} unchanged chart parts.')
     print(f'Synthetic Pearson r, F10 to F20: {correlation(means[1],means[2]):.6f}; Comparator to F10: {correlation(means[0],means[1]):.6f}')
